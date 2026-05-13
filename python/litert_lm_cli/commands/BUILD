@@ -101,7 +101,9 @@ pytype_strict_library(
         "//python/litert_lm_cli:help_formatter",
         "//python/litert_lm_cli:model",
         requirement("click"),
-    ],
+    ] + select({
+        "//conditions:default": [],
+    }),
 )
 
 pytype_strict_library(
@@ -115,7 +117,10 @@ pytype_strict_library(
         "//python/litert_lm_cli:help_formatter",
         "//python/litert_lm_cli:model",
         requirement("click"),
-    ],
+        requirement("prompt_toolkit"),
+    ] + select({
+        "//conditions:default": [],
+    }),
 )
 
 py_test(

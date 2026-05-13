@@ -14,16 +14,329 @@
 
 """Run subcommand for LiteRT-LM CLI."""
 
+import json
 import os
 import sys
+import traceback
 
 import click
+import prompt_toolkit
+from prompt_toolkit import key_binding
 
 import litert_lm
 from litert_lm_cli import common
 from litert_lm_cli import help_formatter
 from litert_lm_cli import model
 from litert_lm_cli.commands import convert as _convert_module
+
+try:
+  # pylint: disable=g-import-not-at-top
+  from litert_lm.adb import adb_engine  # pytype: disable=import-error
+
+  _HAS_ADB = True
+except ImportError:
+  _HAS_ADB = False
+
+
+class SessionState:
+  """State for the interactive session."""
+
+  def __init__(self):
+    self.active_channel = None
+
+
+class LoggingToolEventHandler(litert_lm.ToolEventHandler):
+  """Log tool call and tool response events."""
+
+  def __init__(self, state: SessionState):
+    self.state = state
+
+  def approve_tool_call(self, tool_call):
+    """Logs a tool call."""
+    if self.state.active_channel is not None:
+      click.echo("\n", nl=False)
+      self.state.active_channel = None
+    click.echo(
+        click.style(
+            f"[tool_call] {json.dumps(tool_call['function'])}", fg="green"
+        )
+    )
+    return True
+
+  def process_tool_response(self, tool_response):
+    """Logs a tool response."""
+    click.echo(
+        click.style(f"[tool_response] {json.dumps(tool_response)}", fg="green")
+    )
+    return tool_response
+
+
+def _execute_prompt(
+    state: SessionState,
+    conversation: litert_lm.AbstractConversation,
+    prompt: str,
+    attachments: tuple[str, ...] = (),
+):
+  """Executes a single prompt and prints the result."""
+  state.active_channel = None
+
+  if attachments:
+    content = []
+    for path in attachments:
+      abs_path = os.path.abspath(path)
+      content.append(
+          {"type": model.get_attachment_type(abs_path), "path": abs_path}
+      )
+
+    if prompt:
+      content.append({"type": "text", "text": prompt})
+
+    stream = conversation.send_message_async({
+        "role": "user",
+        "content": content,
+    })
+  else:
+    stream = conversation.send_message_async(prompt)
+
+  try:
+    for chunk in stream:
+      content_list = chunk.get("content", [])
+      for item in content_list:
+        if item.get("type") == "text":
+          if state.active_channel is not None:
+            click.echo()
+            state.active_channel = None
+          click.echo(click.style(item.get("text", ""), fg="yellow"), nl=False)
+
+      channels = chunk.get("channels", {})
+      for channel_name, channel_content in channels.items():
+        if state.active_channel != channel_name:
+          if state.active_channel is not None:
+            click.echo()
+          click.echo(click.style(f"[{channel_name}] ", fg="blue"), nl=False)
+          state.active_channel = channel_name
+        click.echo(click.style(channel_content, fg="yellow"), nl=False)
+    if state.active_channel is not None:
+      click.echo()
+    else:
+      click.echo()
+  except KeyboardInterrupt:
+    conversation.cancel_process()
+    for _ in stream:
+      pass
+    click.echo(click.style("\n[Generation cancelled]", dim=True))
+
+
+def _execute_raw_prompt(session: litert_lm.AbstractSession, prompt: str):
+  """Executes a single raw prompt and prints the result."""
+  session.run_prefill([prompt])
+  stream = session.run_decode_async()
+  try:
+    for chunk in stream:
+      if chunk.texts:
+        click.echo(click.style(chunk.texts[0], fg="yellow"), nl=False)
+    click.echo()
+  except KeyboardInterrupt:
+    for _ in stream:
+      pass
+    click.echo(click.style("\n[Generation cancelled]", dim=True))
+
+
+def _create_keybindings() -> key_binding.KeyBindings:
+  """Creates keybindings for the interactive prompt."""
+  kb = key_binding.KeyBindings()
+
+  @kb.add("enter")
+  def _handle_enter(event):
+    buffer = event.current_buffer
+    if buffer.text.strip():
+      buffer.validate_and_handle()
+
+  @kb.add("c-j")
+  @kb.add("escape", "enter")
+  def _handle_newline(event):
+    event.current_buffer.insert_text("\n")
+
+  @kb.add("c-c")
+  def _handle_clear_or_exit(event):
+    buffer = event.current_buffer
+    if buffer.text:
+      buffer.text = ""
+    else:
+      event.app.exit(exception=EOFError)
+
+  return kb
+
+
+def run_interactive(
+    model_obj: model.Model,
+    is_android: bool = False,
+    backend: str = "cpu",
+    preset: str | None = None,
+    prompt: str | None = None,
+    enable_speculative_decoding: bool | None = None,
+    no_template: bool = False,
+    max_num_tokens: int | None = None,
+    filter_channel_content_from_kv_cache: bool = False,
+    vision_backend: str | None = None,
+    audio_backend: str | None = None,
+    attachments: tuple[str, ...] = (),
+    top_k: int | None = None,
+    top_p: float | None = None,
+    temperature: float | None = None,
+    seed: int | None = None,
+    npu_library_dir: str = "",
+):
+  """Runs the model interactively or with a single prompt."""
+  if not model_obj.exists():
+    click.echo(
+        click.style(
+            f"Could not find {model_obj.to_str()} locally in"
+            f" {model_obj.model_path}.",
+            fg="red",
+        )
+    )
+    return
+
+  state = SessionState()
+
+  try:
+    backend_val = model._parse_backend(backend, npu_library_dir)
+    vision_backend_val = (
+        model._parse_backend(vision_backend, npu_library_dir)
+        if vision_backend
+        else None
+    )
+    audio_backend_val = (
+        model._parse_backend(audio_backend, npu_library_dir)
+        if audio_backend
+        else None
+    )
+
+    sampler_config = None
+    if (
+        top_k is not None
+        or top_p is not None
+        or temperature is not None
+        or seed is not None
+    ):
+      sampler_config = litert_lm.SamplerConfig(
+          top_k=top_k,
+          top_p=top_p,
+          temperature=temperature,
+          seed=seed,
+      )
+
+    if is_android:
+      if not _HAS_ADB:
+        raise ImportError("litert_lm.adb dependencies are not available.")
+      engine_cm = adb_engine.AdbEngine(
+          model_obj.model_path,
+          backend=backend_val,
+          max_num_tokens=max_num_tokens,
+          vision_backend=vision_backend_val,
+          audio_backend=audio_backend_val,
+      )
+    else:
+      engine_cm = litert_lm.Engine(
+          model_obj.model_path,
+          backend=backend_val,
+          enable_speculative_decoding=enable_speculative_decoding,
+          max_num_tokens=max_num_tokens,
+          vision_backend=vision_backend_val,
+          audio_backend=audio_backend_val,
+      )
+
+    with engine_cm as engine:
+      if no_template:
+        runner_cm = engine.create_session(
+            apply_prompt_template=False, sampler_config=sampler_config
+        )
+      else:
+        tools = None
+        messages = None
+        extra_context = None
+        if preset:
+          tools, messages, extra_context = model.load_preset(preset)
+          if tools is None and messages is None and extra_context is None:
+            return
+
+        handler = LoggingToolEventHandler(state) if tools else None
+
+        runner_cm = engine.create_conversation(
+            tools=tools,
+            messages=messages,
+            tool_event_handler=handler,
+            extra_context=extra_context,
+            filter_channel_content_from_kv_cache=filter_channel_content_from_kv_cache,
+            sampler_config=sampler_config,
+        )
+
+      with runner_cm as runner:
+        if prompt:
+          if isinstance(runner, litert_lm.AbstractSession):
+            _execute_raw_prompt(runner, prompt)
+          elif isinstance(runner, litert_lm.AbstractConversation):
+            _execute_prompt(state, runner, prompt, attachments=attachments)
+          return
+
+        click.echo(
+            click.style(
+                "[enter] submit | [ctrl+j] newline | [ctrl+c] clear/exit",
+                fg="cyan",
+            )
+        )
+        click.echo()
+
+        history_path = os.path.join(
+            os.path.expanduser("~"), ".litert-lm", "history"
+        )
+        os.makedirs(os.path.dirname(history_path), exist_ok=True)
+
+        prompt_session = prompt_toolkit.PromptSession(
+            history=prompt_toolkit.history.FileHistory(history_path),
+            key_bindings=_create_keybindings(),
+        )
+
+        is_first_prompt = True
+        while True:
+          try:
+            user_prompt = prompt_session.prompt(
+                prompt_toolkit.ANSI(click.style("> ", fg="green", bold=True)),
+                multiline=True,
+                prompt_continuation=lambda width, line_number, is_soft_wrap: (
+                    ""
+                ),
+            )
+            if not user_prompt:
+              continue
+
+            if isinstance(runner, litert_lm.AbstractSession):
+              _execute_raw_prompt(
+                  runner,
+                  user_prompt,
+              )
+            elif isinstance(runner, litert_lm.AbstractConversation):
+              if is_first_prompt:
+                _execute_prompt(
+                    state, runner, user_prompt, attachments=attachments
+                )
+                is_first_prompt = False
+              else:
+                _execute_prompt(state, runner, user_prompt)
+
+          except EOFError:
+            break
+          except KeyboardInterrupt:
+            click.echo()
+            continue
+          except Exception:  # pylint: disable=broad-exception-caught
+            click.echo(click.style("Error during inference", fg="red"))
+            traceback.print_exc()
+
+  except Exception:  # pylint: disable=broad-exception-caught
+    click.echo(click.style("An error occurred", fg="red"))
+    traceback.print_exc()
 
 
 @click.command(
@@ -286,7 +599,8 @@ def run(
         )
         return
 
-  model_obj.run_interactive(
+  run_interactive(
+      model_obj,
       prompt=prompt,
       is_android=android,
       backend=backend,

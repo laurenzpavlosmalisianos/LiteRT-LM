@@ -14,12 +14,111 @@
 
 """Benchmark subcommand for LiteRT-LM CLI."""
 
+import traceback
+
 import click
 
 import litert_lm
 from litert_lm_cli import common
 from litert_lm_cli import help_formatter
 from litert_lm_cli import model
+
+try:
+  # pylint: disable=g-import-not-at-top
+  from litert_lm.adb import adb_benchmark  # pytype: disable=import-error
+
+  _HAS_ADB = True
+except ImportError:
+  _HAS_ADB = False
+
+
+def run_benchmark(
+    model_obj: model.Model,
+    prefill_tokens: int = 256,
+    decode_tokens: int = 256,
+    is_android: bool = False,
+    backend: str = "cpu",
+    enable_speculative_decoding: bool | None = None,
+    max_num_tokens: int | None = None,
+    npu_library_dir: str = "",
+):
+  """Benchmarks the model."""
+  if not model_obj.exists():
+    click.echo(
+        click.style(
+            f"Could not find {model_obj.to_str()} locally in"
+            f" {model_obj.model_path}.",
+            fg="red",
+        )
+    )
+    return
+
+  try:
+    backend_val = model._parse_backend(backend, npu_library_dir)
+    cache_dir_val = (
+        ":memory"
+        if isinstance(backend_val, litert_lm.Backend.CPU)
+        else ":nocache"
+    )
+
+    if is_android:
+      if not _HAS_ADB:
+        raise ImportError("litert_lm.adb dependencies are not available.")
+      benchmark_obj = adb_benchmark.AdbBenchmark(
+          model_obj.model_path,
+          backend=backend_val,
+          prefill_tokens=prefill_tokens,
+          decode_tokens=decode_tokens,
+          max_num_tokens=max_num_tokens,
+      )
+    else:
+      benchmark_obj = litert_lm.Benchmark(
+          model_obj.model_path,
+          backend=backend_val,
+          prefill_tokens=prefill_tokens,
+          decode_tokens=decode_tokens,
+          cache_dir=cache_dir_val,
+          enable_speculative_decoding=enable_speculative_decoding,
+          max_num_tokens=max_num_tokens,
+      )
+
+    click.echo(
+        f"Benchmarking model: {model_obj.to_str()} ({model_obj.model_path})"
+    )
+    click.echo(f"Backend                    : {backend}")
+    click.echo(f"Number of tokens in prefill: {prefill_tokens}")
+    click.echo(f"Number of tokens in decode : {decode_tokens}")
+    if max_num_tokens is not None:
+      click.echo(f"Max number of tokens       : {max_num_tokens}")
+
+    spec_dec_str = "auto"
+    if enable_speculative_decoding is True:
+      spec_dec_str = "true"
+    elif enable_speculative_decoding is False:
+      spec_dec_str = "false"
+    click.echo(f"Speculative decoding       : {spec_dec_str}")
+    if is_android:
+      click.echo("Target                     : Android")
+
+    result = benchmark_obj.run()
+
+    click.echo("----- Results -----")
+    click.echo(
+        f"Prefill speed:        {result.last_prefill_tokens_per_second:.2f}"
+        " tokens/s"
+    )
+    click.echo(
+        f"Decode speed:         {result.last_decode_tokens_per_second:.2f}"
+        " tokens/s"
+    )
+    click.echo(f"Init time:            {result.init_time_in_second:.4f} s")
+    click.echo(
+        f"Time to first token:  {result.time_to_first_token_in_second:.4f} s"
+    )
+
+  except Exception:  # pylint: disable=broad-exception-caught
+    click.echo(click.style("An error occurred during benchmarking", fg="red"))
+    traceback.print_exc()
 
 
 @click.command(
@@ -110,7 +209,8 @@ def benchmark(
     # runtime/engine/engine_settings.cc
     max_num_tokens = ((prefill_tokens + 1023) // 4096 + 1) * 4096
 
-  model_obj.benchmark(
+  run_benchmark(
+      model_obj,
       prefill_tokens=prefill_tokens,
       decode_tokens=decode_tokens,
       is_android=android,
