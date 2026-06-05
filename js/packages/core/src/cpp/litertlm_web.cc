@@ -44,7 +44,7 @@ void SetupLogging() { drishti::wasm::InitializeLog(); }
 
 /**
  * Fill the prefill_batch_sizes field in AdvancedSettings from the given JS
- * set.
+ * array.
  */
 void setPrefills(litert::lm::AdvancedSettings& advanced_settings,
                  val prefill_batch_sizes) {
@@ -60,14 +60,14 @@ void setPrefills(litert::lm::AdvancedSettings& advanced_settings,
 }
 
 /**
- * Get the prefill_batch_sizes field in AdvancedSettings as a JS set.
+ * Get the prefill_batch_sizes field in AdvancedSettings as a JS array.
  */
 val getPrefills(const litert::lm::AdvancedSettings& advanced_settings) {
-  val jsSet = val::global("Set").new_();
+  val jsArray = val::global("Array").new_();
   for (int prefill_batch_size : advanced_settings.prefill_batch_sizes) {
-    jsSet.call<void>("add", prefill_batch_size);
+    jsArray.call<void>("push", prefill_batch_size);
   }
-  return jsSet;
+  return jsArray;
 }
 
 struct JsBenchmarkInfo {

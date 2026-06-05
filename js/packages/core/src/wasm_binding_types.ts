@@ -201,7 +201,7 @@ export declare interface GpuArtisanConfig {
  * LiteRT-LM AdvancedSettings
  */
 export declare interface AdvancedSettings {
-  prefill_batch_sizes: Set<number>;
+  prefill_batch_sizes: number[];
   num_output_candidates: number;
   configure_magic_numbers: boolean;
   verify_magic_numbers: boolean;

@@ -577,7 +577,7 @@ describe('LiteRtLm tests', () => {
 
       it('sets and gets advanced settings', () => {
         const advancedSettings = {
-          prefill_batch_sizes: new Set([1, 2, 3]),
+          prefill_batch_sizes: [1, 2, 3],
           num_output_candidates: 4,
           configure_magic_numbers: true,
           verify_magic_numbers: false,
@@ -648,7 +648,7 @@ describe('LiteRtLm tests', () => {
             executorSettings.setMaxNumTokens(128);
             executorSettings.setCacheDir(':nocache');
             const advancedSettings = {
-              prefill_batch_sizes: new Set([128]),
+              prefill_batch_sizes: [128],
               num_output_candidates: 1,
               configure_magic_numbers: true,
               verify_magic_numbers: true,
